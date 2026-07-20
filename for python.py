@@ -10,3 +10,4 @@ def _read_full_proxy_config():
             return json.load(f)
     except Exception:
         return None
+# Этот файл необходим исключительно для того чтобы github автоматически дал репозиторию иконку python
