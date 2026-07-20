@@ -125,7 +125,7 @@ async def connect_with_retry(client, bot_token, max_retries=5, delay=5):
     return False
 ```
 
-## Почему это работает
+## Почему это работает (если не работает, то кидайте гайд и свои файла проекта в нейросеть, например: https://claude.ai
 
 - `ConnectionTcpMTProxyAbridged` — встроенный в Telethon класс, реализующий протокол MTProto Proxy
   (обфускация случайными байтами + секретный префикс).
