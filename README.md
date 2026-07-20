@@ -1,141 +1,278 @@
 # Подключение Telegram-бота через MTProto-прокси (TgWsProxy + Telethon)
 
-Гайд объясняет, как подключить Telegram-бота на [Telethon](https://github.com/LonamiWebs/Telethon)
-к [TgWsProxy](https://github.com/Flowseal/tg-ws-proxy) — локальному MTProto-прокси. В отличие от
-базовых гайдов на эту тему, здесь конфиг прокси ищется автоматически и кроссплатформенно,
-а не по одному захардкоженному пути.
+Гайд по подключению Telegram-бота на [Telethon](https://github.com/LonamiWebs/Telethon) к локальному
+MTProto-прокси через [TgWsProxy](https://github.com/Flowseal/tg-ws-proxy). Описан рабочий путь,
+проверенный на практике — только MTProto через TgWsProxy, без SOCKS5 и без прочих альтернатив,
+которые на практике оказались нерабочими.
 
 ## Идея
 
 TgWsProxy поднимает локальный MTProto-прокси и пишет свой конфиг (`host`, `port`, `secret`) в
-стандартную для ОС папку с настройками приложений. Задача бота — найти этот конфиг и передать
-данные в Telethon через `ConnectionTcpMTProxyAbridged`.
+файл на диске. Бот читает этот конфиг, проверяет, что прокси реально отвечает, и подключается через
+Telethon с явным классом `ConnectionTcpMTProxyAbridged`.
 
-Проблема большинства гайдов (и моей предыдущей версии в том числе) — путь к конфигу зашит
-буквально: `C:\Users\User\AppData\Roaming\TgWsProxy\config.json`. Это работает только на конкретной
-машине конкретного человека. У другого юзера другое имя учётки, а на Linux/macOS такого пути вообще
-нет. Ниже — способ находить конфиг правильно на любой системе.
+Прокси в этой схеме — не опциональная штука "для обхода блокировок, если получится". Он обязателен:
+если рабочий прокси не найден, бот не запускается вообще, а не пытается подключиться напрямую.
 
-## Где на самом деле лежит конфиг
+## Шаг 1. Чтение конфига TgWsProxy
 
-| ОС | Путь |
-|---|---|
-| Windows | `%APPDATA%\TgWsProxy\config.json` |
-| macOS | `~/Library/Application Support/TgWsProxy/config.json` |
-| Linux | `$XDG_CONFIG_HOME/tgwsproxy/config.json` (обычно `~/.config/tgwsproxy/config.json`) |
-
-`%APPDATA%` и `$XDG_CONFIG_HOME` — это переменные окружения самой ОС, они не завязаны на конкретное
-имя пользователя, поэтому один и тот же код работает у всех.
-
-Пример содержимого файла:
-
-```json
-{
-  "host": "127.0.0.1",
-  "port": 1080,
-  "secret": "a05020da9c1a504d83fd66ec5c916eb1"
-}
-```
-
-## Чтение секрета
+Путь до конфига хранится не в самом модуле, а во внешнем `config.py` (переменная `PROXY_CONFIG_PATH`) —
+это позволяет не завязывать код на конкретный путь конкретного пользователя жёстко внутри логики прокси:
 
 ```python
-import json
 import os
-import platform
-from pathlib import Path
+import json
+from config import PROXY_CONFIG_PATH
 
-
-def get_proxy_config_path() -> Path:
-    system = platform.system()
-    if system == "Windows":
-        base = os.getenv("APPDATA", str(Path.home() / "AppData" / "Roaming"))
-        return Path(base) / "TgWsProxy" / "config.json"
-    if system == "Darwin":
-        return Path.home() / "Library" / "Application Support" / "TgWsProxy" / "config.json"
-    base = os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config"))
-    return Path(base) / "tgwsproxy" / "config.json"
-
-
-def read_proxy_config() -> dict | None:
-    path = get_proxy_config_path()
-    if not path.exists():
+def _read_full_proxy_config():
+    if not os.path.exists(PROXY_CONFIG_PATH):
         return None
     try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
+        with open(PROXY_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
         return None
-    if "secret" not in data:
-        return None
-    return {
-        "host": data.get("host", "127.0.0.1"),
-        "port": int(data.get("port", 1080)),
-        "secret": data["secret"],
-    }
 ```
 
-Секрет отдаём в Telethon как есть, без ручных манипуляций с префиксами вроде `dd` — библиотека сама
-корректно разбирает разные форматы MTProto-секретов, и подмена префикса вручную только ломает
-подключение у части конфигураций.
+`PROXY_CONFIG_PATH` в `config.py` указывает на файл, который пишет сам TgWsProxy (обычно это
+что-то вроде `%APPDATA%\TgWsProxy\config.json` на Windows — зависит от того, как настроен именно
+твой TgWsProxy).
 
-## Подключение клиента
+## Шаг 2. Проверка, что прокси реально живой
 
-`ConnectionTcpMTProxyAbridged` из `telethon.network` — класс соединения, который умеет говорить с
-MTProto-прокси. Прокси передаётся кортежем `(host, port, secret)`:
+Прочитать секрет из конфига — не гарантия, что прокси сейчас отвечает. Поэтому перед использованием
+делается пинг TCP-соединением:
+
+```python
+import asyncio
+import time
+
+async def _ping_proxy(host, port, timeout=1.0):
+    try:
+        start = time.monotonic()
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout
+        )
+        writer.close()
+        await writer.wait_closed()
+        return (time.monotonic() - start) * 1000
+    except Exception:
+        return None
+```
+
+Если пинг прошёл и меньше 500 мс — прокси считается рабочим:
+
+```python
+async def init_proxy():
+    config = _read_full_proxy_config()
+    if not config:
+        return None
+
+    secret = config.get("secret")
+    host = config.get("host", "127.0.0.1")
+    port = config.get("port", 1080)
+
+    if not (secret and host and port):
+        return None
+
+    ping = await _ping_proxy(host, port)
+    if ping is not None and ping < 500:
+        return (secret, host, port)
+
+    return None
+```
+
+Обрати внимание на **порядок значений в кортеже**: здесь это `(secret, host, port)`. Это важно
+запомнить, потому что при передаче в Telethon порядок другой (см. шаг 3) — если их перепутать,
+подключение сломается молча.
+
+## Шаг 3. Инициализация клиента
 
 ```python
 from telethon import TelegramClient
 from telethon.network import ConnectionTcpMTProxyAbridged
+from config import BOT_TOKEN, API_ID, API_HASH, TEMP_DIR
 
-cfg = read_proxy_config()
-proxy = (cfg["host"], cfg["port"], cfg["secret"]) if cfg else None
+best = await init_proxy()
+if not best:
+    # рабочего прокси нет — бот НЕ подключается напрямую, а прерывает запуск
+    raise RuntimeError("Не удалось найти рабочий прокси")
+
+secret, proxy_host, proxy_port = best
+
+# Порядок для Telethon другой: (host, port, secret)
+proxy = (proxy_host, proxy_port, secret)
+
+session_path = os.path.join(TEMP_DIR, "bot_monitor")  # своя папка проекта, не системный temp
 
 client = TelegramClient(
-    "bot_session",
+    session_path,
     api_id=API_ID,
     api_hash=API_HASH,
-    connection=ConnectionTcpMTProxyAbridged if proxy else None,
-    proxy=proxy,
+    connection=ConnectionTcpMTProxyAbridged,
+    proxy=proxy
 )
 
 await client.start(bot_token=BOT_TOKEN)
 ```
 
-Если конфиг прокси не найден, `proxy` остаётся `None` и Telethon просто подключается напрямую —
-гайд не завязывает бота на обязательное наличие прокси.
+`TEMP_DIR` — переменная из `config.py` проекта, указывающая на рабочую папку для файла сессии.
+Это не системная temp-папка ОС, а папка внутри самого проекта.
 
-## Переподключение при обрыве
+## Шаг 4. Подключение с ретраями и обработкой специфичных ошибок
 
-Сеть до прокси не всегда стабильна, особенно сразу после его запуска. Есть смысл оборачивать
-`client.start()` в ретрай:
+`client.start()` на практике падает по-разному, и часть ошибок Telegram отдаёт не как типизированные
+исключения Telethon, а как обычный `Exception` с текстом ошибки — поэтому часть обработки идёт через
+разбор строки, а не через `except FloodWaitError`:
 
 ```python
-from telethon.errors import FloodWaitError
+import re
+import asyncio
+import logging
 
-async def connect_with_retry(client, bot_token, max_retries=5, delay=5):
-    for attempt in range(max_retries):
+MAX_RETRIES = 10
+RETRY_DELAY = 10
+
+async def connect_with_retry(client):
+    session_path = os.path.join(TEMP_DIR, "bot_monitor.session")
+
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            await client.start(bot_token=bot_token)
+            await asyncio.wait_for(client.start(bot_token=BOT_TOKEN), timeout=30)
+            logging.info("Бот успешно стартовал")
             return True
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds)
-        except (ConnectionError, OSError, asyncio.TimeoutError):
-            await asyncio.sleep(delay)
-    return False
+
+        except asyncio.TimeoutError:
+            logging.error(f"Таймаут подключения (попытка {attempt})")
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY)
+            else:
+                return False
+
+        except Exception as e:
+            error_str = str(e).lower()
+
+            # Telegram иногда требует подождать N секунд перед авторизацией —
+            # приходит НЕ как FloodWaitError, а как обычный текст исключения
+            if "a wait of " in error_str and "seconds is required " in error_str:
+                match = re.search(r'a wait of (\d+) seconds', error_str)
+                if match:
+                    wait_secs = int(match.group(1)) + 5
+                    logging.warning(f"Требуется подождать {wait_secs} сек.")
+                    await asyncio.sleep(wait_secs)
+                    continue
+
+            # Битая/заблокированная сессия — удаляем файлы сессии и пробуем заново
+            if "database is locked " in error_str or "malformed " in error_str:
+                logging.critical("Сессия повреждена. Удаляю для полного перелогина...")
+                try:
+                    if os.path.exists(session_path):
+                        os.remove(session_path)
+                    if os.path.exists(session_path + "-journal"):
+                        os.remove(session_path + "-journal")
+                except Exception:
+                    pass
+                continue
+
+            if attempt < MAX_RETRIES:
+                logging.warning(f"Ошибка подключения: {e}. Попытка {attempt}/{MAX_RETRIES}")
+                await asyncio.sleep(RETRY_DELAY)
+            else:
+                logging.error(f"Не удалось подключиться после {MAX_RETRIES} попыток: {e}")
+                return False
 ```
 
-## Почему это работает (если не работает, то кидайте гайд и свои файла проекта в нейросеть, например: https://claude.ai
+Эти три ветки обработки ошибок — не общая рекомендация "на всякий случай", а конкретные проблемы,
+с которыми реально сталкивается это подключение: таймаут, скрытый под обычным текстом FloodWait,
+и порча файла сессии при обрыве соединения.
 
-- `ConnectionTcpMTProxyAbridged` — встроенный в Telethon класс, реализующий протокол MTProto Proxy
-  (обфускация случайными байтами + секретный префикс).
-- Сервер Telegram видит такое соединение как легитимное, даже если прямой доступ к Telegram API
-  заблокирован на уровне сети.
-- Дополнительные зависимости вроде `python-socks` не нужны — MTProto-прокси поддерживается Telethon
-  из коробки.
+## Шаг 5. Экстренный перезапуск прокси при сетевом сбое
+
+Если во время работы (не при старте, а уже в рантайме — например, в фоновых задачах вроде мониторинга)
+происходит сетевая ошибка, есть механизм экстренного перезапуска локального прокси. Он Windows-only:
+
+```python
+import subprocess
+import os
+import time
+
+def _is_proxy_running(exe_path):
+    try:
+        import psutil
+        exe_name = os.path.basename(exe_path).lower()
+        for proc in psutil.process_iter(['name']):
+            if proc.info['name'] and proc.info['name'].lower() == exe_name:
+                return True
+    except Exception:
+        pass
+    return False
+
+def emergency_launch_proxy(exe_path):
+    if _is_proxy_running(exe_path):
+        return  # прокси уже жив, не трогаем
+
+    exe_name = os.path.basename(exe_path)
+    os.system(f'taskkill /f /im {exe_name} >nul 2>&1')
+    time.sleep(1)
+    subprocess.Popen(exe_path, shell=False)
+```
+
+Проверка через `taskkill` — команда Windows, на Linux/macOS работать не будет. Если у тебя бот крутится
+только на Windows, это не проблема; если планируешь переносить на другую ОС, эту функцию нужно
+переписывать отдельно под неё.
+
+## Почему именно так, а не иначе
+
+- `ConnectionTcpMTProxyAbridged` — единственный подтверждённо рабочий вариант в этой связке.
+  Списки альтернативных прокси (SOCKS5 и подобные) с этим классом соединения несовместимы на уровне
+  протокола и в этом гайде не рассматриваются.
+- Пинг перед использованием прокси нужен, потому что наличие корректного конфига не гарантирует,
+  что прокси-процесс сейчас реально запущен и отвечает.
+- Явная проверка "прокси не найден → не подключаемся" — намеренное решение, а не недоработка:
+  подключение без прокси в этом сценарии не является рабочим вариантом.
 
 ## Ссылки
 
 - Telethon: https://github.com/LonamiWebs/Telethon
 - Документация MTProto Proxy: https://core.telegram.org/mtproto/mtproto-transports#mtproxy
 - TgWsProxy: https://github.com/Flowseal/tg-ws-proxy
+
+## Если не работает, то на это может быть масса причин, лучше в таком случае кидать файлы и гайд в нейросеть.
+
+Несмотря на практическую направленность, **Гайд имеет ряд архитектурных и технических уязвимостей**. Он может перестать работать из-за обновления библиотек, смены окружения или специфических сетевых условий.
+
+Ниже подробно разобраны основные причины, по которым код из гайда может сломаться на практике.
+
+### 1. Проблемы с версиями Telethon и зависимостями
+
+* **Мажорные обновления Telethon (v1.x против v2.x):** Библиотека Telethon развивается, и в версии 2.0 (которая находится в разработке) структура модулей и сетевого стека существенно меняется. Класс `ConnectionTcpMTProxyAbridged`, импортируемый из `telethon.network`, или сам формат передачи кортежа `proxy=(host, port, secret)` могут быть объявлены устаревшими или изменить сигнатуру в новых версиях.
+
+* **Типы MTProto-секретов:** Современные MTProto-прокси часто используют специальные префиксы для обхода DPI — например, `dd` (random padding) или `ee` (Fake-TLS с прикрепленным доменом). В зависимости от версии Telethon, передача «сырого» секрета с Fake-TLS домена в класс `ConnectionTcpMTProxyAbridged` может вызывать ошибки протокола, если парсер библиотеки старой версии не умеет отделять hex-ключ от домена.
+
+* **Скрытая и «тихая» зависимость от `psutil`:** Функция проверки запущенного процесса `_is_proxy_running` пытается импортировать стороннюю библиотеку `psutil` прямо внутри тела функции. Если разработчик не установил её через `pip install psutil`, блок `try...except` молча перехватит `ModuleNotFoundError` и вернет `False`. В результате бот будет думать, что прокси выключен, и при каждом вызове функции `emergency_launch_proxy` будет пытаться «убить» и перезапустить процесс через `taskkill`.
+
+### 2. Привязка к операционной системе (Windows-Only)
+
+* **Несовместимость `taskkill` с Linux/macOS:** Функция экстренного перезапуска прокси использует системную команду Windows `taskkill /f /im`. При попытке запустить этот код в Docker-контейнере, на VPS под управлением Linux или на macOS, вызов `os.system` будет завершаться с ошибкой (или просто не выполнится), так как такой команды в POSIX-системах нет.
+
+* **Блокировка файлов в Windows (`PermissionError`):** В коде предусмотрено удаление сессии при повреждении: `os.remove(session_path)`. Однако в Windows, если фоновый поток Telethon или другой процесс (например, антивирус) всё ещё удерживает дескриптор файла `.session` или `.session-journal`, операционная система не позволит его удалить и выбросит `PermissionError`. Так как в коде стоит глухой `except Exception: pass`, ошибка удалится молча, и бот уйдет в бесконечный цикл попыток подключиться к битой сессии.
+
+### 3. Хрупкость сетевой логики (Пинг и сокеты)
+
+* **Ложное срабатывание лимита в 500 мс:** В функции `init_proxy()` зашит жесткий лимит: прокси считается рабочим только если пинг `< 500` мс. Если бот запускается на слабом железе (например, Raspberry Pi), виртуальной машине под сильной нагрузкой CPU или в момент старта системы, время открытия локального сокета в функции `_ping_proxy` может кратковременно превысить 500 мс. В итоге `init_proxy()` вернет `None`, и бот завершит работу с ошибкой *«Не удалось найти рабочий прокси»*, хотя сам прокси исправен.
+
+* **«Пинг проходит, но прокси мёртв»:** Функция `_ping_proxy` проверяет лишь способность TCP-сокета открыться и закрыться. Однако локальный порт может быть открыт, но сам процесс TgWsProxy при этом может зависнуть на уровне обработки MTProto-трафика или потерять связь с серверами Telegram. Также антивирусы/файрволы часто разрешают локальные TCP-соединения (пинг будет успешным), но блокируют нестандартный шифрованный трафик внутри сокета.
+
+### 4. Ненадежный парсинг ошибок (Хардкод строк)
+
+* **Зависимость от английского текста исключений:** В шаге 4 код пытается отловить ограничение по частоте запросов (FloodWait) не через стандартный класс исключения, а через поиск подстрок `"a wait of "` и `"seconds is required "` в тексте ошибки с помощью регулярного выражения.
+
+* Если в новой версии Telethon или в самом API Telegram изменится формулировка текста ошибки (например, слово *"required"* заменят на *"needed"* или поменяется регистр), регулярное выражение `re.search(r'a wait of (\d+) seconds', error_str)` перестанет срабатывать.
+
+* Бот не распознает требование подождать, упадет в ветку стандартной ошибки, исчерпает 10 попыток подключения (`MAX_RETRIES = 10`) и полностью прекратит работу.
+
+### 5. Проблемы с внешним конфигурационным файлом
+
+* **Жёсткая зависимость от структуры `config.py`:** Гайд подразумевает наличие внешнего модуля `config.py`, откуда импортируются переменные `PROXY_CONFIG_PATH`, `BOT_TOKEN`, `API_ID`, `API_HASH` и `TEMP_DIR`. Если разработчик переносит код в другой проект, где конфигурация хранится, например, в переменных окружения `.env` или в формате YAML, код придется переписывать.
+
+* **Изменение формата конфига TgWsProxy:** Код ожидает, что в JSON-файле прокси обязательно будут ключи `"secret"`, `"host"` и `"port"`. Если автор утилиты TgWsProxy в будущем обновлении изменит структуру JSON (например, вложит настройки портов в отдельный объект `"listen": {"port": 1080}`), функция `init_proxy` перестанет находить данные и вернет `None`.
