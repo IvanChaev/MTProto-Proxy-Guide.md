@@ -239,6 +239,7 @@ def emergency_launch_proxy(exe_path):
 
 ## Если не работает, то на это может быть масса причин, лучше в таком случае кидать файлы и гайд в нейросеть.
 
+Gemini 3.1 Pro:
 Несмотря на практическую направленность, **Гайд имеет ряд архитектурных и технических уязвимостей**. Он может перестать работать из-за обновления библиотек, смены окружения или специфических сетевых условий.
 
 Ниже подробно разобраны основные причины, по которым код из гайда может сломаться на практике.
@@ -276,3 +277,135 @@ def emergency_launch_proxy(exe_path):
 * **Жёсткая зависимость от структуры `config.py`:** Гайд подразумевает наличие внешнего модуля `config.py`, откуда импортируются переменные `PROXY_CONFIG_PATH`, `BOT_TOKEN`, `API_ID`, `API_HASH` и `TEMP_DIR`. Если разработчик переносит код в другой проект, где конфигурация хранится, например, в переменных окружения `.env` или в формате YAML, код придется переписывать.
 
 * **Изменение формата конфига TgWsProxy:** Код ожидает, что в JSON-файле прокси обязательно будут ключи `"secret"`, `"host"` и `"port"`. Если автор утилиты TgWsProxy в будущем обновлении изменит структуру JSON (например, вложит настройки портов в отдельный объект `"listen": {"port": 1080}`), функция `init_proxy` перестанет находить данные и вернет `None`.
+
+## Как исправить критические уязвимости (Рефакторинг)
+
+### 1. Переход на типизированные исключения Telethon
+
+Вместо парсинга строк через регулярные выражения стоит сначала ловить официальные исключения библиотеки, и только как fallback использовать regex.
+
+```python
+import asyncio
+import logging
+import os
+import re
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError, AuthKeyError
+
+MAX_RETRIES = 10
+RETRY_DELAY = 10
+
+async def connect_with_retry(client: TelegramClient, bot_token: str, session_path: str) -> bool:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            await asyncio.wait_for(client.start(bot_token=bot_token), timeout=30)
+            logging.info("Бот успешно стартовал")
+            return True
+
+        except asyncio.TimeoutError:
+            logging.error(f"Таймаут подключения (попытка {attempt}/{MAX_RETRIES})")
+
+        # 1. Ловим стандартный FloodWait от Telethon
+        except FloodWaitError as e:
+            wait_secs = e.seconds + 5
+            logging.warning(f"Telegram требует подождать {wait_secs} сек. (FloodWaitError)")
+            await asyncio.sleep(wait_secs)
+            continue
+
+        except Exception as e:
+            error_str = str(e).lower()
+
+            # 2. Fallback для нестандартных текстовых ошибок ожидания
+            if "wait of" in error_str and "seconds" in error_str:
+                match = re.search(r'wait of (\d+) seconds', error_str)
+                if match:
+                    wait_secs = int(match.group(1)) + 5
+                    logging.warning(f"Требуется подождать {wait_secs} сек. (Text match)")
+                    await asyncio.sleep(wait_secs)
+                    continue
+
+            # 3. Обработка битых сессий с проверкой прав доступа
+            if any(err in error_str for err in ("database is locked", "malformed", "authkey")):
+                logging.critical("Сессия повреждена. Пытаюсь удалить...")
+                for suffix in ("", "-journal"):
+                    file_to_remove = f"{session_path}{suffix}"
+                    if os.path.exists(file_to_remove):
+                        try:
+                            os.remove(file_to_remove)
+                        except PermissionError:
+                            logging.error(f"Файл {file_to_remove} заблокирован ОС. Нужен ручной перезапуск.")
+                            return False
+                continue
+
+            logging.warning(f"Непредвиденная ошибка: {e}. Попытка {attempt}/{MAX_RETRIES}")
+
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(RETRY_DELAY)
+            
+    return False
+
+```
+
+### 2. Кроссплатформенный перезапуск прокси без тихих сбоев
+
+Чтобы код не падал молча без `psutil` и работал как на Windows, так и на Linux, добавляем явную проверку ОС и логирование ошибки импорта.
+
+```python
+import subprocess
+import os
+import sys
+import time
+import logging
+
+def _is_proxy_running(exe_name: str) -> bool:
+    try:
+        import psutil
+        for proc in psutil.process_iter(['name']):
+            if proc.info['name'] and proc.info['name'].lower() == exe_name.lower():
+                return True
+        return False
+    except ImportError:
+        logging.error("Библиотека psutil не установлена! Проверка процессов невозможна.")
+        # Возвращаем True, чтобы не пытаться бесконечно убивать процесс вслепую
+        return True
+
+def emergency_launch_proxy(exe_path: str):
+    exe_name = os.path.basename(exe_path)
+    if _is_proxy_running(exe_name):
+        return
+
+    logging.warning(f"Прокси {exe_name} не найден. Пытаюсь перезапустить...")
+    
+    if sys.platform == "win32":
+        os.system(f'taskkill /f /im {exe_name} >nul 2>&1')
+        time.sleep(1)
+        subprocess.Popen(exe_path, shell=False)
+    elif sys.platform.startswith("linux"):
+        # Аналог для Linux (например, если прокси запущен как systemd-сервис или бинарник)
+        os.system(f'pkill -f {exe_name} > /dev/null 2>&1')
+        time.sleep(1)
+        subprocess.Popen(["nohup", exe_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        logging.error(f"Автоперезапуск не реализован для ОС: {sys.platform}")
+
+```
+
+### 3. Убираем хрупкий пинг в 500 мс
+
+Для локального сокета (`127.0.0.1`) замер задержки вообще не имеет смысла — TCP-хэндшейк внутри loopback-интерфейса всегда быстрый, если процесс жив. Ограничение в `500 мс` только создаёт ложные срабатывания при скачах нагрузки на CPU.
+
+Достаточно проверять сам факт успешного открытия сокета с таймаутом в `1.5` секунды:
+
+```python
+async def _is_socket_open(host: str, port: int, timeout: float = 1.5) -> bool:
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout
+        )
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+        return False
+
+```
